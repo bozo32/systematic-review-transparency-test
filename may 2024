@@ -1,0 +1,204 @@
+#Script to assess the transparency with which an academic article reports its underlying research
+# Import necessary libraries
+import requests  # Used for making HTTP requests
+import json      # Used for working with JSON data
+import pandas as pd  # Used for handling data in a tabular format
+import os        # Used for interacting with the operating system
+import fitz      # PyMuPDF, used for handling PDF files
+import re        # Used for regular expressions, for text manipulation
+import time      # Used for controlling execution timing
+import logging   # Used for logging information for debugging
+
+# Setup logging to record information about program execution and errors
+logging.basicConfig(filename='processing_log.txt', level=logging.INFO, format='%(asctime)s:%(levelname)s:%(message)s')
+
+# Define questions and their descriptions
+questions_with_criteria = {
+    "Central research question(s)": {
+        "response options": [
+            "0: Missing - No central research questions explicitly stated.",
+            "1: Unclear - CRQs are mentioned but not clearly defined or only appear in the abstract.",
+            "2: Clear - CRQs are explicitly stated, directly answerable, and specific within the text."
+        ],
+        "task": "The central research question in an empirical article is the primary question that it sets out to answer. This question is often implict in the conclusions that a paper makes. They should be directly and clearly stated at the start of an article and they should be something that is possibel to answer with empirical research. Your task is to assess whether the central research questions are explicitly stated."
+    },
+    "Data collection methods": {
+        "response options": [
+            "0: Missing - No data collection methods are specified.",
+            "1: Unclear - Methods are mentioned but not detailed (e.g., type of interview, observation techniques not specified).",
+            "2: Clear - Methods are thoroughly described, including details about how data was collected."
+        ],
+        "task": "Empirical results are supposed to arise from appropriate data. This data must be collected. Data are collected using data collection methods. How seriously we take results depends, in part, on both understanding how data was collected and if those data collection methods were appropriate. Your task is to evaluate whether the data collection methods are adequately described and if they can produce the findings necessary to support the conclusions the paper reaches."
+    },
+    "Sampling": {
+        "response options": [
+            "0: Missing - No sampling methods are mentioned.",
+            "1: Unclear - Some sampling details are provided, but key information is missing or vague.",
+            "2: Clear - Sampling methods are explicitly described and justify how they support the research questions."
+        ],
+        "task": "Research tries to make claims about many objects by measuring a few. The few that are measured are called a sample. Whether or not claims can be generalised from the sample to the population depends on whether or not the sample is representative of the population. Papers should both define their sample and discuss its quality. Your task is to review the clarity (are they described in detail?) and appropriateness (does it support inferences to the population) of the sample."
+    },
+    "Sample size": {
+        "response options": [
+            "0: Missing - No mention of sample size.",
+            "1: Unclear - Sample size is mentioned imprecisely (e.g., 'more than 100 participants') or is incomplete for some data collection methods.",
+            "2: Clear - Exact sample size is provided, with rationale for its adequacy."
+        ],
+        "task": "Given the same quality, a larger sample will support stronger generalisation to the population. Size matters. Your task is to determine if sample size is mentioned and if the impact of that size on the strength of generalisations that can be made from the sample to the population is discussed."
+    },
+    "Analysis": {
+        "response options": [
+            "0: Missing - No analysis methods are described.",
+            "1: Present - General mention of data handling post-collection (e.g., types of analysis used are listed).",
+            "2: Clear - Comprehensive description of analysis methods, including how data was analyzed to meet research objectives and a discussion arguing why these methods were appropriate."
+        ],
+        "task": "How results are turned into findings and then conclusions matters. If the analysis methods are not appropriate, then the findings and conclusions will not be valid. Your task is to determine the extent to which analysis methods are clearly described and the extent to which their choice is clearly justified."
+    },
+    "Conclusions": {
+        "response options": [
+            "0: Missing - No conclusions are drawn or they do not relate to the research questions.",
+            "1: Present - Conclusions are provided, with at least a weak link to the research questions.",
+            "2: Clear - Conclusions are directly tied to research questions, well-supported by data."
+        ],
+        "task": "The conclusions in a paper are supposed to be based on findings that are reported in that paper and they should connect to the general research questions. Your task is to determine the extent to which the conclusions drawn are based on the findings reported and the extent to which they answer the general research question."
+    },
+    "Limitations": {
+        "response options": [
+            "0: Missing - No limitations of the study are discussed.",
+            "1: Unclear - Some limitations are mentioned, but with minimal detail.",
+            "2: Clear - Limitations are thoroughly discussed, with explanations of their potential impact on the study's reliability and validity."
+        ],
+        "task": "All empirical research is limited. There may be problems with measurement, with conclusions within the study and with generalisation. All limitations have effects. Your task is to determine the extent to which the study's limitations are acknowledged and, for those that are acknowledged, the extent to which their impact is both detailed and reflected in the claims made about reliability and validity."
+    }
+}
+
+# Function to extract text from a PDF file
+def extract_text_from_pdf(pdf_path):
+    """Extracts text from a PDF file using PyMuPDF library."""
+    logging.info(f"Extracting text from {pdf_path}")
+    doc = fitz.open(pdf_path)  # Open the PDF file
+    text = ' '.join([page.get_text() for page in doc])  # Extract text from each page and join it into a single string
+    doc.close()  # Close the PDF document
+    return re.sub('\s+', ' ', text)  # Remove extra whitespaces and return the cleaned text
+
+# Create initial prompt for model to evaluate the document text based on provided task and options
+def create_initial_prompt(question_text, question_details, text):
+    """
+    Generates an initial structured prompt for model evaluation.
+    This version explicitly instructs the model on how to format its response with detailed evaluation options.
+    """
+    response_options = "\n".join(f"{idx}: {desc}" for idx, desc in enumerate(question_details['response options']))
+    prompt = f"""
+    <context>
+    Use the following document text to answer the query according to the task and response options provided below.
+    Respond in JSON format.
+    </context>
+    Task Description: {question_details['task']}
+    Response Options: {response_options}
+    Document Text: {text}
+
+    Please provide your evaluation in the following JSON format:
+    {{
+        "question": "{question_details['task']}",
+        "evaluation": "Choose from: '0 - Missing', '1 - Unclear', '2 - Clear'",
+        "reasoning": "provide evidence from the text that supports your evaluation",
+        "format_example": {{
+            "question": "Review the extent to which the study's limitations are acknowledged and elaborated upon, considering their implications for the reliability and validity of the findings.",
+            "evaluation": "2 - Clear",
+            "reasoning": "The text provides discussion of limits for more than half of the claims they make."
+        }}
+    }}
+    """
+    return prompt
+
+
+import re  # Ensure regular expressions library is imported
+
+def create_detailed_prompt(question_text, initial_response, text):
+    """
+    Generates a detailed follow-up prompt using the initial response to request justifications and evidence.
+    This version includes enhanced error handling and logging for debugging.
+    """
+    try:
+        # Log the initial response for debugging
+        logging.info(f"Received initial response: {initial_response}")
+
+        # Attempt to extract JSON from the initial response
+        # Assuming the JSON is enclosed in curly braces {}
+        match = re.search(r'\{.*\}', initial_response, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            response_data = json.loads(json_str)
+            evaluation = response_data.get('evaluation', 'No evaluation found')
+
+            prompt = f"""
+            <context>
+            Based on your initial evaluation of '{evaluation}', provide detailed justifications and supporting evidence.
+            Document Text: {text}
+            </context>
+            
+            Reflect on the evaluation:
+            {{
+                "reflection": "Consider if the evaluation '{evaluation}' was correct.",
+                "supporting evidence": "Cite direct quotations from the text to support or refute the initial evaluation."
+            }}
+            """
+            return prompt
+        else:
+            # If no JSON found, log error and return a failure message
+            logging.error("No JSON found in the initial response")
+            return "Error: No JSON data found in the initial response. Please check the format of the initial response."
+
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse JSON from the initial response: {e}")  # Log JSON parsing errors
+        return "Error in generating detailed prompt due to response parsing failure."
+
+
+# Function to call the model
+def call_model(prompt):
+    url = "http://localhost:11435/api/generate"
+    data = {
+        "model": "llama3:8b-instruct-q5_K_M",
+        "prompt": prompt,
+        "stream": False,
+        "temperature": 0,
+        "num_ctx": 8000,
+        "seed": 123
+    }
+    headers = {'Content-Type': 'application/json'}
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code == 200:
+        return response.json().get('response', '')
+    else:
+        logging.error(f"Failed to get valid response from the model: {response.text}")
+        return "Error in fetching response."
+
+# Main function to process PDF files
+def process_pdf_files(folder_path, questions, output_file):
+    data_rows = []
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.pdf'):
+            pdf_path = os.path.join(folder_path, filename)
+            extracted_text = extract_text_from_pdf(pdf_path)
+            for question_text, details in questions.items():
+                initial_prompt = create_initial_prompt(question_text, details, extracted_text)
+                initial_response = call_model(initial_prompt)
+                
+                detailed_prompt = create_detailed_prompt(question_text, initial_response, extracted_text)
+                detailed_response = call_model(detailed_prompt)
+                
+                data_rows.append({
+                    "Filename": filename,
+                    "Question": question_text,
+                    "Initial Response": initial_response,
+                    "Detailed Response": detailed_response
+                })
+
+    with open(output_file, 'w') as json_file:
+        json.dump(data_rows, json_file, indent=4)
+    logging.info("Data processing complete and saved to JSON.")
+
+# Specify the paths and process the PDF files
+pdf_folder = '/Users/peter/ai-computing-assistant/jupyter/test-data/'  # Path to the folder containing PDF files
+output_json = '/Users/peter/ai-computing-assistant/jupyter/output.json'  # Path to the output JSON file
+process_pdf_files(pdf_folder, questions_with_criteria, output_json)  # Call the function to process the files
